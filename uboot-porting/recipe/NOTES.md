@@ -86,7 +86,7 @@ The uboot maintained by NXP is uboot-imx-rel_imx_4.1.15_2.1.0_ga.tar.bz2
 
 # We have tried to play with the uboot maintained by NXP. We have to make out own uboot modifications. 
 
-	$ cp uboot-imx-rel_imx_4.1.15_2.1.0_ga_nxp uboot-imx-rel_imx_4.1.15_2.1.0_ga_alientek
+	$ cp -r ../../nxp-evk-reference/uboot-imx-rel_imx_4.1.15_2.1.0_ga_nxp uboot-imx-rel_imx_4.1.15_2.1.0_ga_alientek   # from uboot-porting/ported/
 
 	$ cd uboot-imx-rel_imx_4.1.15_2.1.0_ga_nxp_alientek
 
