@@ -253,7 +253,7 @@ The uboot maintained by NXP is uboot-imx-rel_imx_4.1.15_2.1.0_ga.tar.bz2
 					.vmode          = FB_VMODE_NONINTERLACED
 			} } };
 
-	Change the following in line 775, ~/Projects/linux/IMX6ULL/linux-os-porting/kernel-porting/migrated/linux-imx-rel_imx_4.1.15_2.1.0_ga_alientek/arch/arm/boot/dts/imx6ull-alientek-emmc-luyaohan1001.dts:
+	Change the following in line 775, ~/Projects/linux/IMX6ULL/linux-os-porting/kernel-porting/ported/linux-imx-rel_imx_4.1.15_2.1.0_ga_alientek/arch/arm/boot/dts/imx6ull-alientek-emmc-luyaohan1001.dts:
 
 			&lcdif {
 				pinctrl-names = "default";
