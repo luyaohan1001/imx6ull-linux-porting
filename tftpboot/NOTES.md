@@ -6,9 +6,9 @@
 
 # Make a local folder for storing things we need to transfer using TFTP
 
-	$ mkdir /home/luyaohan1001/Projects/imx6ull-linux-migration/tftpboot
+	$ mkdir /home/luyaohan1001/Projects/imx6ull-linux-porting/tftpboot
 
-	$ chmod 777 /home/luyaohan1001/Projects/imx6ull-linux-migration/tftpboot
+	$ chmod 777 /home/luyaohan1001/Projects/imx6ull-linux-porting/tftpboot
 
 # Configure TFTP on ubuntu 16.04
 
@@ -23,7 +23,7 @@
 			wait = yes
 			user = root
 			server = /usr/sbin/in.tftpd
-			server_args = -s /home/luyaohan1001/Projects/imx6ull-linux-migration/tftpboot/ 		#(!) Must have the last '/' forward slash!
+			server_args = -s /home/luyaohan1001/Projects/imx6ull-linux-porting/tftpboot/ 		#(!) Must have the last '/' forward slash!
 			disable = no
 			per_source = 11
 			cps = 100 2
@@ -37,7 +37,7 @@
 	# Enter the following:
 
 		TFTP_USERNAME="tftp"
-		TFTP_DIRECTORY="/home/luyaohan1001/Projects/imx6ull-linux-migration/tftpboot/"
+		TFTP_DIRECTORY="/home/luyaohan1001/Projects/imx6ull-linux-porting/tftpboot/"
 		TFTP_ADDRESS=":69"
 		TFTP_OPTIONS="-l -c -s"
 

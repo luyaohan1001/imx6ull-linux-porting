@@ -1,4 +1,4 @@
-List of files chanegd during the migration:
+List of files changed during the porting:
 	Config file: ./include/configs/mx6ull_alientek_emmc.h
 	Driver file: ./board/freescale/mx6ull_alientek_emmc/mx6ull_alientek_emmc.c
 	Net Driver: drivers/net/phy/phy.c 

@@ -18,7 +18,7 @@
 	$ apt install nfs-kernel-server rpcbind
 
 
-0. linux-imx-rel_imx_4.1.15_2.1.0_ga.tar.bz2 is the official kernel for NXP I.MX6ULL EVK development board. We will migrate the kernel based on this release.
+0. linux-imx-rel_imx_4.1.15_2.1.0_ga.tar.bz2 is the official kernel for NXP I.MX6ULL EVK development board. We will port the kernel based on this release.
 
 1. Make our own version
 

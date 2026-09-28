@@ -8,7 +8,7 @@
 
 		add the following:
 
-		/home/luyaohan1001/Projects/imx6ull-linux-migration/nfs *(rw,sync,no_root_squash)
+		/home/luyaohan1001/Projects/imx6ull-linux-porting/nfs *(rw,sync,no_root_squash)
 
 	# Restart the NFS service
 
@@ -23,7 +23,7 @@
 	# console=tty1 would set LCD as console
 	# console=ttymxc0,115200 set serial USB as second console
 
-	=> setenv bootargs 'console=tty1 console=ttymxc0,115200 root=/dev/nfs nfsroot=10.0.0.111:/home/luyaohan1001/Projects/imx6ull-linux-migration/nfs/rootfs,proto=tcp rw ip=10.0.0.200:10.0.0.111:10.0.0.1:255.255.255.0::eth0:off'
+	=> setenv bootargs 'console=tty1 console=ttymxc0,115200 root=/dev/nfs nfsroot=10.0.0.111:/home/luyaohan1001/Projects/imx6ull-linux-porting/nfs/rootfs,proto=tcp rw ip=10.0.0.200:10.0.0.111:10.0.0.1:255.255.255.0::eth0:off'
 
 	=> saveenv
 
