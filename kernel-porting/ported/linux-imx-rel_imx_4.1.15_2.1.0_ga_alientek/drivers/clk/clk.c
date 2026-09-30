@@ -2456,7 +2456,9 @@ static int __clk_init(struct device *dev, struct clk *clk_user)
 	hlist_for_each_entry_safe(orphan, tmp2, &clk_orphan_list, child_node) {
 		if (orphan->num_parents && orphan->ops->get_parent) {
 			i = orphan->ops->get_parent(orphan->hw);
-			if (!strcmp(clk->name, orphan->parent_names[i]))
+			/* get_parent() returns -EINVAL (as u8) for an unknown mux value */
+			if (i < orphan->num_parents &&
+			    !strcmp(clk->name, orphan->parent_names[i]))
 				clk_core_reparent(orphan, clk);
 			continue;
 		}
