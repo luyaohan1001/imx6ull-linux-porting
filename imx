@@ -19,6 +19,8 @@ Usage: imx              # kernel: distclean + defconfig + full build
                         #   stop autoboot, bootz, and open screen on the console
        imx load emmc    # same, but boot the rootfs already on eMMC
        imx load prompt  # same, but stop at the U-Boot prompt
+       imx module [dir] # out-of-tree module (default modules/hello) against the
+                        #   last kernel build -> <dir>/out/*.ko and out/ko
        imx qemu [args]  # boot zImage + rootfs.cpio.gz in QEMU (mcimx6ul-evk);
                         #   extra args go to QEMU
        imx qemu debug   # same, but paused with a gdb server on :3334
@@ -94,6 +96,14 @@ cp arch/arm/boot/zImage /out/
 cp arch/arm/boot/dts/imx6ull-alientek-emmc*.dtb /out/ 2>/dev/null || true
 cp .config /out/config
 cp vmlinux /out/            # ELF with symbols (and DWARF with DEBUG_INFO) for gdb
+# Loadable modules: /lib/modules tree for the rootfs, and a flat ko/ folder
+# (served over TFTP by `imx qemu`). The image has no depmod; run BusyBox's
+# depmod on the target if you want modprobe.
+rm -rf /out/modules /out/ko && mkdir -p /out/ko
+make modules_install INSTALL_MOD_PATH=/out/modules > /dev/null
+rm -f /out/modules/lib/modules/*/build /out/modules/lib/modules/*/source
+find /out/modules -name "*.ko" -exec cp {} /out/ko/ \\;
+echo "modules: $(ls /out/ko | wc -l) .ko files in out/ko"
 ''' + QEMU_DTB + '''
 ls -l /out
 '''
@@ -128,6 +138,11 @@ cd /build/rootfs
 mkdir -p dev proc mnt sys tmp root lib usr/lib lib/modules/4.1.15
 cp -a /usr/arm-linux-gnueabihf/lib/*.so* lib/
 cp -a /repo/rootfs-porting/overlay/. .
+# Kernel modules from the last kernel build (imx), if there is one
+if [ -d "/repo/$KMODS" ]; then
+    cp -a "/repo/$KMODS" lib/
+    echo "kernel modules: $(find lib/modules -name '*.ko' | wc -l)"
+fi
 chmod +x etc/init.d/rcS
 # An initramfs gets no automatic devtmpfs, so the console node must exist
 # before init runs; the kernel starts /init from an initramfs.
@@ -249,6 +264,8 @@ def docker_build(tree, script, mode="", out=None):
            "-v", f"{ROOT}:/repo:ro", "-v", f"{VOLUME}:/build", "-v", f"{out}:/out",
            "-e", f"PREFIX={os.path.relpath(tree, ROOT)}/",
            "-e", f"TREE={os.path.basename(tree)}", "-e", f"MODE={mode}",
+           "-e", "KMODS=" + os.path.relpath(
+               os.path.join(KERNEL, "out", "modules", "lib", "modules"), ROOT),
            IMAGE, "bash", "-ec", script]
     return subprocess.call(cmd)
 
@@ -412,6 +429,49 @@ def load(target):
     os.execvp("screen", ["screen", port, "115200"])
 
 
+# Out-of-tree module: copied into the case-sensitive volume next to the kernel
+# build tree (which has the matching .config and Module.symvers) and built
+# with the kernel's own Makefile.
+MODULE_BUILD = r'''
+rm -rf /build/modules/$NAME && mkdir -p /build/modules
+cp -r "/repo/$MODDIR" /build/modules/$NAME && rm -rf /build/modules/$NAME/out
+make -C /build/$KTREE M=/build/modules/$NAME modules
+cp /build/modules/$NAME/*.ko /out/
+ls -l /out
+'''
+
+
+def build_module(path):
+    path = os.path.abspath(path or os.path.join(ROOT, "modules", "hello"))
+    if not os.path.exists(os.path.join(path, "Makefile")):
+        sys.exit(f"no Makefile in {path}")
+    if os.path.commonpath([path, ROOT]) != ROOT:
+        sys.exit(f"module must be inside the repo: {path}")
+    if not os.path.exists(os.path.join(KERNEL, "out", "vmlinux")):
+        sys.exit("build the kernel first (imx): modules need its build tree")
+    out = os.path.join(path, "out")
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    subprocess.check_call(["docker", "build", "-q", "-t", IMAGE, "-"],
+                          stdin=open(os.path.join(ROOT, "Dockerfile.imx")),
+                          stdout=subprocess.DEVNULL)
+    rc = subprocess.call([
+        "docker", "run", "--rm", "-v", f"{ROOT}:/repo:ro",
+        "-v", f"{VOLUME}:/build", "-v", f"{out}:/out",
+        "-e", f"NAME={os.path.basename(path)}",
+        "-e", f"MODDIR={os.path.relpath(path, ROOT)}",
+        "-e", f"KTREE={os.path.basename(KERNEL)}",
+        IMAGE, "bash", "-ec", MODULE_BUILD])
+    if rc == 0:
+        ko = os.path.join(KERNEL, "out", "ko")       # served by imx qemu's TFTP
+        os.makedirs(ko, exist_ok=True)
+        for f in glob.glob(os.path.join(out, "*.ko")):
+            shutil.copy(f, ko)
+            print(f"{os.path.relpath(f)} -> in QEMU: "
+                  f"tftp -g -r {os.path.basename(f)} 10.0.2.2")
+    return rc
+
+
 def qemu(extra):
     """Boot the kernel and our rootfs (as initramfs) in QEMU.
 
@@ -445,12 +505,19 @@ def qemu(extra):
     print("QEMU mcimx6ul-evk: press Enter at 'Please press Enter...'. "
           "To quit, type `reboot` (or Ctrl-A X); Ctrl-A C toggles the QEMU "
           "monitor.\n")
+    # User-mode network on ENET1 (Linux eth1; QEMU connects the first NIC to
+    # ENET1 at 0x02188000). The guest is 10.0.2.15 (set by the kernel via ip=),
+    # the Mac is 10.0.2.2, and QEMU's TFTP server there serves out/ko, so a
+    # rebuilt module is one `tftp -g -r foo.ko 10.0.2.2` away.
+    ko = os.path.join(KERNEL, "out", "ko")
+    os.makedirs(ko, exist_ok=True)
     # -no-reboot: a guest reboot exits QEMU instead of restarting it.
     os.execvp("qemu-system-arm", [
         "qemu-system-arm", "-M", "mcimx6ul-evk", "-m", "512M", "-nographic",
-        "-no-reboot",
+        "-no-reboot", "-nic", f"user,tftp={ko}",
         "-kernel", files[0], "-dtb", files[1], "-initrd", files[2],
-        "-append", "console=ttymxc0,115200 kgdboc=ttymxc0,115200", *extra])
+        "-append", "console=ttymxc0,115200 kgdboc=ttymxc0,115200 "
+                   "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth1:off", *extra])
 
 
 # Kernel entry and root-filesystem entry points, in boot order (keep in sync
@@ -529,6 +596,8 @@ The build used your menuconfig choices. To keep them for future builds:
                           out=os.path.join(ROOTFS, "out"))
     elif mode == "compdb":
         rc = compdb()
+    elif mode == "module":
+        rc = build_module(sys.argv[2] if len(sys.argv) > 2 else "")
     elif mode == "qemu":
         rc = qemu(sys.argv[2:])
     elif mode == "gdb":

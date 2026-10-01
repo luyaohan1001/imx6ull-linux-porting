@@ -65,6 +65,7 @@ imx load [ramdisk|emmc|prompt]   # boot the board over USB, see below
 imx qemu [qemu args]   # boot the kernel + rootfs in QEMU, see below
 imx qemu debug         # same, paused, gdb server on :3334 (IMX_GDB_PORT)
 imx gdb                # arm gdb on out/vmlinux, attached to imx qemu debug
+imx module [dir]       # build an out-of-tree module (default modules/hello)
 ```
 
 | Output | Where |
@@ -171,6 +172,32 @@ starts `imx qemu debug` in a terminal (that terminal is the serial console) and
 Click in the margin for breakpoints, F10/F11 to step, and use the Debug Console
 for gdb commands (`-exec si`, `-exec x/8i $pc`). Stopping the session stops
 QEMU. Run `imx` first after kernel changes; the debugger uses `out/vmlinux`.
+
+### Kernel modules (`imx module`)
+
+Our own modules live outside the kernel tree, one folder each under
+`modules/` with a Kbuild `Makefile` (`obj-m := hello.o`). `imx module
+modules/hello` builds it in Docker against the kernel build tree of the last
+`imx` (a module must match that kernel's config and symbol versions, so run
+`imx` first after kernel config changes) and puts `hello.ko` in
+`modules/hello/out/` and in the kernel's `out/ko/`.
+
+`imx qemu` gives the guest a network (QEMU user mode on ENET1 = `eth1`,
+`10.0.2.15`; the Mac is `10.0.2.2`) and serves `out/ko/` with QEMU's built-in
+TFTP server, so a rebuilt module is loaded without rebuilding the rootfs:
+
+```sh
+imx module                     # on the Mac
+# in QEMU:
+cd /tmp && tftp -g -r hello.ko 10.0.2.2
+insmod hello.ko who=qemu       # hello: hello, qemu!
+cat /sys/module/hello/parameters/who
+rmmod hello                    # hello: goodbye, qemu
+```
+
+Kernel builds also install the kernel's own loadable modules (`=m` options)
+into `out/modules/`, and `imx rootfs` copies them to `/lib/modules/4.1.15/` in
+the rootfs. BusyBox's `depmod` on the target enables `modprobe`.
 
 ### Code navigation (clangd)
 
