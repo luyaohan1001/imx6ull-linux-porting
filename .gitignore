@@ -1,1 +1,10 @@
 nfs/rootfs/
+
+# Build outputs and editor/LSP state created by ./imx
+out/
+compile_commands.json
+.cache/
+.imx-load-*.uuu
+
+# macOS Finder metadata
+.DS_Store
