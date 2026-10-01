@@ -1,0 +1,23 @@
+{
+    // clangd reads compile_commands.json in each kernel/U-Boot tree
+    // (made by `imx compdb`, and by `imx` / `imx uboot` after a build).
+    "clangd.path": "/usr/bin/clangd",
+    "clangd.arguments": [
+        "--background-index",
+        "--header-insertion=never",
+        "--completion-style=detailed",
+        "-j=8"
+    ],
+    // cpptools' IntelliSense fights with clangd; keep cpptools for debugging only.
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "search.exclude": {
+        "**/out/**": true,
+        "**/.cache/**": true,
+        "**/*.o": true,
+        "**/.*.cmd": true
+    },
+    "files.watcherExclude": {
+        "**/out/**": true,
+        "**/.cache/**": true
+    }
+}
