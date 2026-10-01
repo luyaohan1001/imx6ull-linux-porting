@@ -1,0 +1,7 @@
+# Build environment for the i.MX6ULL 4.1.15 kernel, U-Boot and busybox rootfs (used by ./imx)
+FROM ubuntu:16.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc-arm-linux-gnueabihf libc6-dev-armhf-cross gcc make bc lzop u-boot-tools libncurses5-dev \
+        rsync git ca-certificates cpio \
+    && rm -rf /var/lib/apt/lists/*
+ENV ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-

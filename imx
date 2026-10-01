@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""Build and load the i.MX6ULL (alientek eMMC) 4.1.15 kernel, U-Boot and rootfs.
+
+Builds run in Docker: macOS filesystems are case-insensitive, which clobbers
+files such as net/netfilter/xt_DSCP.c vs xt_dscp.c. So the source is synced
+into a case-sensitive Docker volume, the colliding files are restored from
+git, and the build runs there. Results are copied to <tree>/out.
+
+Usage: imx              # kernel: distclean + defconfig + full build
+       imx menuconfig   # kernel: same, but run menuconfig before building
+       imx dtbs         # kernel: incremental device-tree-only build
+       imx uboot        # U-Boot: distclean + defconfig + build (u-boot.imx)
+       imx rootfs       # rootfs: busybox + glibc + overlay -> rootfs.tar.gz,
+                        #         uRamdisk (initramfs for imx load)
+       imx rootfs menuconfig  # same, but run busybox menuconfig first
+       imx compdb       # clangd: compile_commands.json for kernel + U-Boot
+                        #   from the last builds (imx / imx uboot also do it)
+       imx load         # uuu: U-Boot + zImage + dtb (+ uRamdisk) to RAM, then
+                        #   stop autoboot, bootz, and open screen on the console
+       imx load emmc    # same, but boot the rootfs already on eMMC
+       imx load prompt  # same, but stop at the U-Boot prompt
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+KERNEL = os.path.join(ROOT, "kernel-porting", "ported",
+                      "linux-imx-rel_imx_4.1.15_2.1.0_ga_alientek")
+UBOOT = os.path.join(ROOT, "uboot-porting", "ported",
+                     "uboot-imx-rel_imx_4.1.15_2.1.0_ga_alientek")
+ROOTFS = os.path.join(ROOT, "rootfs-porting")
+BUSYBOX = os.path.join(ROOTFS, "ported", "busybox-1.29.0")
+IMAGE = "imx6ull-kernel-builder"
+VOLUME = "imx6ull-kernel-src"
+DTB = "imx6ull-alientek-emmc-luyaohan1001.dtb"
+KERNEL_ADDR = "0x80800000"
+DTB_ADDR = "0x83000000"
+RAMDISK_ADDR = "0x83800000"
+
+SYNC = r'''
+mkdir -p /build/$TREE
+rsync -a --delete --exclude=out --exclude=.git --exclude=.config \
+    --exclude="*.o" --exclude="*.cmd" /repo/$PREFIX /build/$TREE/
+cd /build/$TREE
+# Restore files that collide on a case-insensitive filesystem (from the
+# git index, so staged renames work before they are committed)
+git config --global --add safe.directory /repo
+git -C /repo ls-files -- "$PREFIX" | sed "s|^$PREFIX||" \
+    | sort -f | uniq -Di | while read f; do
+        git -C /repo show ":$PREFIX$f" > "$f"
+    done
+echo "restored $(git -C /repo ls-files -- "$PREFIX" | sort -f | uniq -Di | wc -l) case-colliding files"
+'''
+
+KERNEL_FULL = SYNC + '''
+make distclean
+make imx_alientek_emmc_defconfig
+if [ "$MODE" = menuconfig ]; then
+    make menuconfig
+    make savedefconfig
+    cp defconfig /out/defconfig
+fi
+make all -j$(nproc)
+cp arch/arm/boot/zImage /out/
+cp arch/arm/boot/dts/imx6ull-alientek-emmc*.dtb /out/ 2>/dev/null || true
+cp .config /out/config
+ls -l /out
+'''
+
+KERNEL_DTBS = SYNC + '''
+[ -f .config ] || make imx_alientek_emmc_defconfig
+make dtbs
+cp arch/arm/boot/dts/imx6ull-alientek-emmc*.dtb /out/
+ls -l /out
+'''
+
+UBOOT_FULL = SYNC + '''
+make distclean
+make mx6ull_alientek_emmc_defconfig
+make -j$(nproc)
+cp u-boot.imx u-boot.bin /out/
+ls -l /out
+'''
+
+# The busybox .config is hand-tuned and tracked (SYNC skips .config).
+# Runtime libraries come from the toolchain's glibc; /etc comes from
+# rootfs-porting/overlay.
+ROOTFS_FULL = SYNC + '''
+cp /repo/$PREFIX.config .config
+[ "$MODE" = menuconfig ] && make menuconfig
+make clean
+make -j$(nproc)
+rm -rf /build/rootfs && mkdir /build/rootfs
+make install CONFIG_PREFIX=/build/rootfs
+cd /build/rootfs
+mkdir -p dev proc mnt sys tmp root lib usr/lib lib/modules/4.1.15
+cp -a /usr/arm-linux-gnueabihf/lib/*.so* lib/
+cp -a /repo/rootfs-porting/overlay/. .
+chmod +x etc/init.d/rcS
+# An initramfs gets no automatic devtmpfs, so the console node must exist
+# before init runs; the kernel starts /init from an initramfs.
+mknod -m 600 dev/console c 5 1
+ln -s bin/busybox init
+tar czf /out/rootfs.tar.gz --numeric-owner --owner=0 --group=0 .
+find . | cpio -o -H newc -R 0:0 --quiet | gzip -9 > /out/rootfs.cpio.gz
+mkimage -A arm -O linux -T ramdisk -C none -n rootfs \
+    -d /out/rootfs.cpio.gz /out/uRamdisk > /dev/null
+cp /build/$TREE/.config /out/busybox.config
+echo "rootfs: $(du -sh . | cut -f1), $(find . | wc -l) entries"
+ls -l /out
+'''
+
+# For clangd: the compile command of every object (first line of its
+# .o.cmd), the headers that exist only in the build tree (generated ones,
+# asm/arch links), and the cross compiler's own headers.
+COMPDB = r'''
+cd /build/$TREE
+rm -rf /out/lsp && mkdir -p /out/lsp/gen
+find . -name "*.o.cmd" -print0 | xargs -0 head -qn1 > /out/lsp/cmds.txt
+find -L . -path ./include/config -prune -o -name "*.h" -print | while read -r f; do
+    [ -e "/repo/$PREFIX$f" ] || cp --parents -L "$f" /out/lsp/gen/
+done
+cp -rL /usr/lib/gcc-cross/arm-linux-gnueabihf/5/include /out/lsp/gcc-include
+echo "$(wc -l < /out/lsp/cmds.txt) commands, $(find /out/lsp/gen -type f | wc -l) build-only headers"
+'''
+
+# gcc options clang rejects or warns about.
+GCC_ONLY = re.compile(r"-Wp,-MD,.*|-fno-ipa-sra|-fno-var-tracking-assignments|"
+                      r"-fconserve-stack|--param=.*|-mno-thumb-interwork|"
+                      r"-mapcs|-mword-relocations|-fno-partial-inlining|"
+                      r"-Wno-unused-but-set-variable|-mno-unaligned-access|"
+                      r"-fno-toplevel-reorder|-ffixed-r9|-fstack-usage|"
+                      r"-Wno-maybe-uninitialized|-Wno-unused-const-variable|"
+                      r"-fno-delete-null-pointer-checks|-mabi=apcs-gnu|"
+                      r"-Werror=date-time|-fno-reorder-blocks|-fno-ipa-cp-clone|"
+                      r"-mthumb-interwork")
+
+
+def write_compdb(tree):
+    lsp = os.path.join(tree, "out", "lsp")
+    gen = os.path.join(lsp, "gen")
+    entries = []
+    for line in open(os.path.join(lsp, "cmds.txt"), errors="replace"):
+        if " := " not in line:
+            continue
+        args = []
+        for a in shlex.split(line.split(" := ", 1)[1]):
+            if a.startswith(";"):
+                break
+            args.append(a.rstrip(";"))
+            if a.endswith(";"):
+                break
+        srcs = [a for a in args if a.endswith(".c")]
+        if not srcs or not args[0].endswith("gcc"):
+            continue
+        out = ["clang", "--target=arm-linux-gnueabihf",
+               "-Wno-unknown-warning-option"]
+        it = iter(args[1:])
+        for a in it:
+            if GCC_ONLY.fullmatch(a):
+                continue
+            if a.startswith("-D"):
+                a = a.replace("\\#", "#")     # gcc takes "\#s", clang wants "#s"
+            if a == "-isystem":
+                next(it)
+                out += ["-isystem", os.path.join(lsp, "gcc-include")]
+                continue
+            if a in ("-I", "-include", "-o"):
+                a += " " + next(it)
+            out += a.split(" ", 1) if a.startswith(("-I ", "-include ",
+                                                   "-o ")) else [a]
+            if a.startswith("-I"):
+                d = os.path.normpath(os.path.join(gen, a[2:].strip()))
+                if os.path.isdir(d):
+                    out.append("-I" + d)
+        # Headers generated next to their source ("timeconst.h").
+        d = os.path.join(gen, os.path.dirname(srcs[-1]))
+        if os.path.isdir(d):
+            out += ["-iquote", d]
+        entries.append({"directory": tree,
+                        "file": os.path.join(tree, srcs[-1]),
+                        "arguments": out})
+    path = os.path.join(tree, "compile_commands.json")
+    with open(path, "w") as f:
+        json.dump(entries, f, indent=1)
+    print(f"{path}: {len(entries)} files")
+
+
+def compdb(trees=(KERNEL, UBOOT)):
+    rc = 0
+    for tree in trees:
+        print(f"--- compile_commands.json for {os.path.basename(tree)}")
+        rc |= docker_build(tree, COMPDB)
+        if not rc:
+            write_compdb(tree)
+    return rc
+
+
+UUU_SCRIPT = f'''uuu_version 1.2.39
+SDP: boot -f {{uboot}} -nojump
+SDP: write -f {{zimage}} -addr {KERNEL_ADDR}
+SDP: write -f {{dtb}} -addr {DTB_ADDR}
+{{ramdisk}}SDP: jump -f {{uboot}} -ivt
+'''
+
+
+def docker_build(tree, script, mode="", out=None):
+    subprocess.check_call(["docker", "build", "-q", "-t", IMAGE, "-"],
+                          stdin=open(os.path.join(ROOT, "Dockerfile.imx")),
+                          stdout=subprocess.DEVNULL)
+    subprocess.check_call(["docker", "volume", "create", VOLUME],
+                          stdout=subprocess.DEVNULL)
+    out = out or os.path.join(tree, "out")
+    os.makedirs(out, exist_ok=True)
+    tty = ["-it"] if sys.stdin.isatty() else []
+    cmd = ["docker", "run", "--rm", *tty,
+           "-v", f"{ROOT}:/repo:ro", "-v", f"{VOLUME}:/build", "-v", f"{out}:/out",
+           "-e", f"PREFIX={os.path.relpath(tree, ROOT)}/",
+           "-e", f"TREE={os.path.basename(tree)}", "-e", f"MODE={mode}",
+           IMAGE, "bash", "-ec", script]
+    return subprocess.call(cmd)
+
+
+def find_serial():
+    """The board's USB-serial console (override with IMX_SERIAL)."""
+    if os.environ.get("IMX_SERIAL"):
+        return os.environ["IMX_SERIAL"]
+    for pattern in ("/dev/cu.usbserial-*", "/dev/cu.wchusbserial*",
+                    "/dev/cu.SLAB_USBtoUART*", "/dev/cu.usbmodem*"):
+        ports = sorted(glob.glob(pattern))
+        if ports:
+            return ports[0]
+    return None
+
+
+def run_uuu(script):
+    """Run uuu and stop it once the final SDP jump is done.
+
+    After the jump the board leaves serial download mode and runs U-Boot,
+    but uuu keeps waiting for a next-stage device that never comes.
+    """
+    proc = subprocess.Popen(["sudo", "uuu", "-v", script], cwd=ROOT,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    seen = b""
+    jumped_at = None
+    while True:
+        ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+        if ready:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.flush()
+            seen += chunk
+            # Verbose mode: "Start Cmd:SDP: jump ..." then "Okay"; progress
+            # bar: "5/ 5 [===100%===] SDP: jump ..." on one line.
+            i = seen.find(b"SDP: jump")
+            lines = re.split(rb"[\r\n]", seen)
+            if jumped_at is None and i >= 0 and (
+                    b"Okay" in seen[i:] or
+                    any(b"SDP: jump" in l and b"100%" in l for l in lines)):
+                jumped_at = time.time()
+        if proc.poll() is not None:
+            break
+        if jumped_at and time.time() - jumped_at > 0.2:
+            # Be quick: U-Boot's autoboot countdown is only 3 s.
+            for sig in (signal.SIGINT, signal.SIGTERM):   # sudo relays both
+                proc.send_signal(sig)
+                try:
+                    proc.wait(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+            return 0
+    return proc.wait()
+
+
+def uboot_console(port, commands, timeout=15):
+    """Stop U-Boot's autoboot on the serial console and type commands."""
+    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        tty.setraw(fd, termios.TCSANOW)     # don't flush what already arrived
+        attrs = termios.tcgetattr(fd)
+        attrs[2] |= termios.CLOCAL | termios.CREAD
+        attrs[4] = attrs[5] = termios.B115200
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+        def read(wait):
+            data = b""
+            end = time.time() + wait
+            while time.time() < end:
+                if select.select([fd], [], [], 0.05)[0]:
+                    try:
+                        data += os.read(fd, 4096)
+                    except BlockingIOError:
+                        pass
+            sys.stdout.buffer.write(data)
+            sys.stdout.flush()
+            return data
+
+        seen = b""
+        deadline = time.time() + timeout
+        tries = 0
+        while b"=> " not in seen[-200:]:
+            if time.time() > deadline:
+                return False
+            # Any key stops the countdown; Ctrl-C leaves fastboot mode (also
+            # sent now and then, in case the fastboot message was missed).
+            tries += 1
+            ctrl_c = b"astboot" in seen[-400:] or tries % 3 == 0
+            os.write(fd, b"\x03" if ctrl_c else b"\r")
+            seen += read(0.2)
+        for cmd in commands:
+            os.write(fd, cmd.encode() + b"\r")
+            read(0.3)
+        return True
+    finally:
+        os.close(fd)
+
+
+def load(target):
+    files = {
+        "uboot": os.path.join(UBOOT, "out", "u-boot.imx"),
+        "zimage": os.path.join(KERNEL, "out", "zImage"),
+        "dtb": os.path.join(KERNEL, "out", DTB),
+    }
+    ramdisk = os.path.join(ROOTFS, "out", "uRamdisk")
+    missing = [f for f in files.values() if not os.path.exists(f)]
+    if missing:
+        sys.exit("missing (run `imx uboot` / `imx` first):\n  " +
+                 "\n  ".join(missing))
+    if not target:
+        target = "ramdisk" if os.path.exists(ramdisk) else "emmc"
+    if target == "ramdisk" and not os.path.exists(ramdisk):
+        sys.exit(f"missing (run `imx rootfs` first):\n  {ramdisk}")
+
+    k, d, r = KERNEL_ADDR[2:], DTB_ADDR[2:], RAMDISK_ADDR[2:]
+    commands = {
+        "ramdisk": ["setenv bootargs 'console=ttymxc0,115200 "
+                    "kgdboc=ttymxc0,115200'",
+                    f"bootz {k} {r} {d}"],
+        "emmc": ["setenv bootargs 'console=ttymxc0,115200 kgdboc=ttymxc0,115200 "
+                 "root=/dev/mmcblk1p2 rootwait rw'", f"bootz {k} - {d}"],
+        "prompt": [],
+    }[target]
+
+    # uuu resolves script paths relative to the script's directory (and
+    # mangles quoted absolute paths), so keep the script and paths in ROOT.
+    rel = {k: os.path.relpath(v, ROOT) for k, v in files.items()}
+    rel["ramdisk"] = ""
+    if target != "emmc" and os.path.exists(ramdisk):
+        rel["ramdisk"] = (f"SDP: write -f {os.path.relpath(ramdisk, ROOT)} "
+                          f"-addr {RAMDISK_ADDR}\n")
+    port = find_serial()
+    print("Board: boot switches in USB download mode (01000000), OTG and "
+          "USB_TTL cables in, power on.")
+    print(f"Serial console: {port or 'not found (set IMX_SERIAL)'}\n")
+    if subprocess.call(["sudo", "-v"]) != 0:     # ask for the password now
+        return 1
+
+    with tempfile.NamedTemporaryFile("w", suffix=".uuu", prefix=".imx-load-",
+                                     dir=ROOT, delete=False) as f:
+        f.write(UUU_SCRIPT.format(**rel))
+    try:
+        rc = run_uuu(os.path.basename(f.name))
+    finally:
+        os.unlink(f.name)
+    if rc != 0:
+        return rc
+
+    if not port:
+        print("\nNo serial port found. In the U-Boot console type:\n  " +
+              "\n  ".join(commands))
+        return 0
+    print(f"\n--- {port}: stopping autoboot, booting {target} ---")
+    if not uboot_console(port, commands):
+        print("\nNo U-Boot prompt seen; opening the console anyway.")
+    time.sleep(0.5)
+    print("\n--- screen: Ctrl-A K Y to quit ---")
+    os.execvp("screen", ["screen", port, "115200"])
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode in ("", "menuconfig"):
+        rc = docker_build(KERNEL, KERNEL_FULL, mode) or compdb([KERNEL])
+        if rc == 0 and mode == "menuconfig":
+            defconfig = os.path.join(KERNEL, "arch", "arm", "configs",
+                                     "imx_alientek_emmc_defconfig")
+            print(f"""
+The build used your menuconfig choices. To keep them for future builds:
+  cp {os.path.relpath(os.path.join(KERNEL, "out", "defconfig"))} \\
+     {os.path.relpath(defconfig)}""")
+    elif mode == "dtbs":
+        rc = docker_build(KERNEL, KERNEL_DTBS)
+    elif mode == "uboot":
+        rc = docker_build(UBOOT, UBOOT_FULL) or compdb([UBOOT])
+    elif mode == "rootfs":
+        sub = sys.argv[2] if len(sys.argv) > 2 else ""
+        if sub not in ("", "menuconfig"):
+            sys.exit(__doc__)
+        rc = docker_build(BUSYBOX, ROOTFS_FULL, sub,
+                          out=os.path.join(ROOTFS, "out"))
+    elif mode == "compdb":
+        rc = compdb()
+    elif mode == "load":
+        sub = sys.argv[2] if len(sys.argv) > 2 else ""
+        if sub not in ("", "ramdisk", "emmc", "prompt"):
+            sys.exit(__doc__)
+        rc = load(sub)
+    else:
+        sys.exit(__doc__)
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()
