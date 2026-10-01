@@ -1,0 +1,36 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            // QEMU paused with a gdb server on :3334; this terminal is the
+            // board's serial console (press Enter there for a shell).
+            "label": "imx qemu debug",
+            "type": "shell",
+            "command": "${workspaceFolder}/imx qemu debug",
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "imx-qemu",
+                "pattern": { "regexp": "^__never_matches__$" },
+                "background": {
+                    "activatesByDefault": true,
+                    "beginsPattern": "QEMU is paused",
+                    "endsPattern": "QEMU mcimx6ul-evk"
+                }
+            },
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": false }
+        },
+        {
+            "label": "imx qemu stop",
+            "type": "shell",
+            "command": "pkill -f 'qemu-system-arm -M mcimx6ul-evk' || true",
+            "presentation": { "reveal": "never" }
+        },
+        {
+            "label": "imx build kernel",
+            "type": "shell",
+            "command": "${workspaceFolder}/imx",
+            "group": "build",
+            "problemMatcher": []
+        }
+    ]
+}

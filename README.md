@@ -62,6 +62,9 @@ imx rootfs             # BusyBox + glibc + overlay -> rootfs.tar.gz, uRamdisk
 imx rootfs menuconfig  # same, with BusyBox menuconfig first
 imx compdb             # clangd compile_commands.json (imx / imx uboot do it too)
 imx load [ramdisk|emmc|prompt]   # boot the board over USB, see below
+imx qemu [qemu args]   # boot the kernel + rootfs in QEMU, see below
+imx qemu debug         # same, paused, gdb server on :3334 (IMX_GDB_PORT)
+imx gdb                # arm gdb on out/vmlinux, attached to imx qemu debug
 ```
 
 | Output | Where |
@@ -94,6 +97,80 @@ go straight into RAM over USB.
 filesystem already on eMMC partition 2; `imx load prompt` stops at `=>`. Never
 type `boot` at the U-Boot prompt: it loads the old kernel from eMMC over the one
 just sent.
+
+### Running in QEMU (`imx qemu`)
+
+`imx qemu` boots `zImage` and `rootfs-porting/out/rootfs.cpio.gz` on QEMU's
+`mcimx6ul-evk` machine (`brew install qemu`), with the serial console in the
+terminal. Press Enter for a shell. To quit, type `reboot` (QEMU runs with
+`-no-reboot`, so a reboot exits) or press `Ctrl-A X`; `Ctrl-A C` toggles the
+QEMU monitor. Extra arguments go to QEMU, e.g. `imx qemu -s -S` waits for gdb
+on port 1234. kdb works too (`kgdboc=ttymxc0` is passed).
+
+QEMU emulates the i.MX6**UL**, not the 6ULL, and not all of it:
+
+- It uses `qemu/imx6ul-qemu.dts`, NXP's 6UL EVK tree plus the Cortex-A7
+  architected timer, with `gpt1` disabled (QEMU's GPT model runs at 0 Hz). The
+  Alientek board tree can't be used: it needs 6ULL-only blocks such as the
+  SNVS IOMUXC at 0x02290000. `imx` builds it into `out/imx6ul-qemu.dtb`.
+- `drivers/clk/clk.c` has a bounds check for mux parent indices: QEMU's clock
+  controller returns an out-of-range mux value, and without the check the
+  kernel crashes in `imx6ul_clocks_init` before the console is up.
+- No LCD, touch, camera, SD/eMMC (hence harmless `mmc0: Timeout` messages).
+
+So QEMU tests the kernel core and the rootfs; board-specific hardware still
+needs the real board.
+
+### Single-stepping the boot (`imx qemu debug` + `imx gdb`)
+
+```sh
+imx qemu debug    # terminal 1: QEMU waits for gdb before running anything
+imx gdb           # terminal 2: gdb on out/vmlinux, stopped at stext
+```
+
+The defconfig has `CONFIG_DEBUG_INFO=y`, and every kernel build copies
+`vmlinux` (symbols + DWARF) to `out/`. `imx gdb` uses `arm-none-eabi-gdb` (Arm
+GNU Toolchain), maps the Docker build path to the source tree on the Mac, and
+sets these breakpoints (VS Code sets the same ones), in boot order:
+
+| Breakpoint | Where | Stops when |
+|------------|-------|------------|
+| `stext` | `arch/arm/kernel/head.S` | first kernel instruction, MMU still off |
+| `start_kernel` | `init/main.c` | first C function |
+| `populate_rootfs` | `init/initramfs.c` | the initramfs (`rootfs.cpio.gz`) is unpacked (rootfs initcall) |
+| `prepare_namespace` | `init/do_mounts.c` | a disk rootfs is mounted from `root=`; only without an initramfs `/init`, so not hit with `imx qemu` |
+| `run_init_process` | `init/main.c` | `/init` is executed: the kernel hands over to the rootfs |
+
+The list is `BOOT_BREAKPOINTS` in `imx` and `postRemoteConnectCommands` in
+`.vscode/launch.json`. Then:
+
+| gdb | Does |
+|-----|------|
+| `si` / `ni` | one instruction (into / over calls) |
+| `b start_kernel`, `c` | run to the C entry point (`init/main.c`) |
+| `s` / `n` | one source line (into / over calls) |
+| `bt`, `info registers`, `x/8i $pc` | stack, registers, disassembly |
+| `layout src` / `layout asm` | source / assembly view |
+
+The zImage decompressor writes the kernel over software breakpoints, so
+`imx gdb` (and the VS Code config) mark the kernel image `0x80008000`-
+`0x80990000` read-only for gdb (`mem ... ro`); gdb then uses hardware
+breakpoints there automatically, and plain `break` works. If the kernel grows
+past `__init_end` (see `System.map`), raise that end address. Kernel symbols work
+before the MMU is on because `PAGE_OFFSET` (0x80000000) equals the DDR base, so
+virtual and physical kernel addresses are the same. The kernel is built with
+`-O2`, so `n` sometimes jumps around and some variables show as optimized out.
+
+The gdb server uses port 3334, not QEMU's default 1234, so it doesn't clash with
+other QEMU sessions.
+
+**In VS Code:** Run and Debug → **Kernel boot (QEMU)** (F5). `.vscode/tasks.json`
+starts `imx qemu debug` in a terminal (that terminal is the serial console) and
+`.vscode/launch.json` attaches the Microsoft C/C++ debugger (`cppdbg`) with
+`arm-none-eabi-gdb`, stops at `stext`, and maps the build paths to the source.
+Click in the margin for breakpoints, F10/F11 to step, and use the Debug Console
+for gdb commands (`-exec si`, `-exec x/8i $pc`). Stopping the session stops
+QEMU. Run `imx` first after kernel changes; the debugger uses `out/vmlinux`.
 
 ### Code navigation (clangd)
 

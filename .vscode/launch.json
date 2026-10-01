@@ -1,0 +1,48 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // Same as `imx qemu debug` + `imx gdb`: starts QEMU (task), attaches
+            // arm-none-eabi-gdb to :3334 and stops at stext (head.S, MMU off).
+            "name": "Kernel boot (QEMU)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/kernel-porting/ported/linux-imx-rel_imx_4.1.15_2.1.0_ga_alientek/out/vmlinux",
+            "cwd": "${workspaceFolder}/kernel-porting/ported/linux-imx-rel_imx_4.1.15_2.1.0_ga_alientek",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/Applications/ArmGNUToolchain/14.3.rel1/arm-none-eabi/bin/arm-none-eabi-gdb",
+            "miDebuggerServerAddress": "localhost:3334",
+            "stopAtConnect": false,
+            // The zImage decompressor writes the kernel over software
+            // breakpoints. Marking the kernel image (.text + .init) read-only
+            // makes gdb use hardware breakpoints there, so breakpoints clicked
+            // in the editor survive decompression.
+            "setupCommands": [
+                { "text": "set pagination off" },
+                { "text": "set mem inaccessible-by-default off" },
+                { "text": "mem 0x80008000 0x80990000 ro" }
+            ],
+            // Earliest kernel entry points:
+            //   stext              first kernel instruction (head.S, MMU off)
+            //   start_kernel       first C function (init/main.c)
+            // Entering the root filesystem:
+            //   populate_rootfs    unpacks the initramfs (rootfs.cpio.gz)
+            //   prepare_namespace  mounts root= from disk (only when there
+            //                      is no initramfs /init, e.g. eMMC rootfs)
+            //   run_init_process   execs /init: kernel -> rootfs user space
+            "postRemoteConnectCommands": [
+                { "text": "hbreak stext" },
+                { "text": "hbreak start_kernel" },
+                { "text": "hbreak populate_rootfs" },
+                { "text": "hbreak prepare_namespace" },
+                { "text": "hbreak run_init_process" }
+            ],
+            // Debug info has the Docker build path; show the Mac source instead.
+            "sourceFileMap": {
+                "/build/linux-imx-rel_imx_4.1.15_2.1.0_ga_alientek": "${workspaceFolder}/kernel-porting/ported/linux-imx-rel_imx_4.1.15_2.1.0_ga_alientek"
+            },
+            "preLaunchTask": "imx qemu debug",
+            "postDebugTask": "imx qemu stop"
+        }
+    ]
+}

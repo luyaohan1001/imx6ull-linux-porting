@@ -1,0 +1,30 @@
+/*
+ * Device tree for running the kernel under QEMU's mcimx6ul-evk machine.
+ *
+ * QEMU emulates the i.MX6UL, not the 6ULL, so this starts from NXP's
+ * 6UL EVK tree rather than the Alientek board tree (which uses 6ULL-only
+ * blocks such as the SNVS IOMUXC at 0x02290000). Two changes:
+ *  - QEMU's GPT model runs at 0 Hz, so disable gpt1 ...
+ *  - ... and use the Cortex-A7's architected timer instead.
+ *
+ * Built by ./imx into <kernel>/out/imx6ul-qemu.dtb; used by `imx qemu`.
+ */
+
+#include "imx6ul-14x14-evk.dts"
+
+/ {
+	model = "QEMU mcimx6ul-evk (i.MX6UL EVK)";
+
+	timer {
+		compatible = "arm,armv7-timer";
+		interrupt-parent = <&intc>;
+		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_LEVEL_LOW)>;
+	};
+};
+
+&gpt1 {
+	status = "disabled";
+};

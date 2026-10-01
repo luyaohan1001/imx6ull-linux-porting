@@ -19,12 +19,18 @@ Usage: imx              # kernel: distclean + defconfig + full build
                         #   stop autoboot, bootz, and open screen on the console
        imx load emmc    # same, but boot the rootfs already on eMMC
        imx load prompt  # same, but stop at the U-Boot prompt
+       imx qemu [args]  # boot zImage + rootfs.cpio.gz in QEMU (mcimx6ul-evk);
+                        #   extra args go to QEMU
+       imx qemu debug   # same, but paused with a gdb server on :3334
+                        #   (port: IMX_GDB_PORT)
+       imx gdb [args]   # arm gdb on out/vmlinux, attached to `imx qemu debug`
 """
 import glob
 import json
 import os
 import re
 import shlex
+import shutil
 import select
 import signal
 import subprocess
@@ -47,6 +53,8 @@ DTB = "imx6ull-alientek-emmc-luyaohan1001.dtb"
 KERNEL_ADDR = "0x80800000"
 DTB_ADDR = "0x83000000"
 RAMDISK_ADDR = "0x83800000"
+# Not QEMU's default 1234, which other QEMU sessions (e.g. YesRTOS) use.
+GDB_PORT = os.environ.get("IMX_GDB_PORT", "3334")
 
 SYNC = r'''
 mkdir -p /build/$TREE
@@ -63,6 +71,16 @@ git -C /repo ls-files -- "$PREFIX" | sed "s|^$PREFIX||" \
 echo "restored $(git -C /repo ls-files -- "$PREFIX" | sort -f | uniq -Di | wc -l) case-colliding files"
 '''
 
+# QEMU-only device tree (qemu/imx6ul-qemu.dts) for `imx qemu`.
+QEMU_DTB = '''
+cp /repo/qemu/imx6ul-qemu.dts arch/arm/boot/dts/
+if make imx6ul-qemu.dtb; then
+    cp arch/arm/boot/dts/imx6ul-qemu.dtb /out/
+else
+    echo "warning: imx6ul-qemu.dtb not built (imx qemu will not work)"
+fi
+'''
+
 KERNEL_FULL = SYNC + '''
 make distclean
 make imx_alientek_emmc_defconfig
@@ -75,6 +93,8 @@ make all -j$(nproc)
 cp arch/arm/boot/zImage /out/
 cp arch/arm/boot/dts/imx6ull-alientek-emmc*.dtb /out/ 2>/dev/null || true
 cp .config /out/config
+cp vmlinux /out/            # ELF with symbols (and DWARF with DEBUG_INFO) for gdb
+''' + QEMU_DTB + '''
 ls -l /out
 '''
 
@@ -82,6 +102,7 @@ KERNEL_DTBS = SYNC + '''
 [ -f .config ] || make imx_alientek_emmc_defconfig
 make dtbs
 cp arch/arm/boot/dts/imx6ull-alientek-emmc*.dtb /out/
+''' + QEMU_DTB + '''
 ls -l /out
 '''
 
@@ -391,6 +412,100 @@ def load(target):
     os.execvp("screen", ["screen", port, "115200"])
 
 
+def qemu(extra):
+    """Boot the kernel and our rootfs (as initramfs) in QEMU.
+
+    QEMU's mcimx6ul-evk emulates the i.MX6UL, so this uses the 6UL EVK
+    device tree adapted in qemu/imx6ul-qemu.dts, not the board's.
+    """
+    files = [os.path.join(KERNEL, "out", "zImage"),
+             os.path.join(KERNEL, "out", "imx6ul-qemu.dtb"),
+             os.path.join(ROOTFS, "out", "rootfs.cpio.gz")]
+    if not os.path.exists(files[1]):
+        # Kernels built before `imx qemu` existed lack both the QEMU dtb
+        # and the clk.c fix QEMU needs, so rebuild the kernel first.
+        print("No QEMU device tree yet: building the kernel first (imx).\n")
+        if docker_build(KERNEL, KERNEL_FULL) or compdb([KERNEL]):
+            return 1
+    if not os.path.exists(files[2]):
+        print("No rootfs yet: building it first (imx rootfs).\n")
+        if docker_build(BUSYBOX, ROOTFS_FULL, out=os.path.join(ROOTFS, "out")):
+            return 1
+    missing = [f for f in files if not os.path.exists(f)]
+    if missing:
+        sys.exit("missing (run `imx` / `imx rootfs` first):\n  " +
+                 "\n  ".join(missing))
+    if not shutil.which("qemu-system-arm"):
+        sys.exit("qemu-system-arm not found (brew install qemu)")
+    if extra[:1] == ["debug"]:
+        # -S: don't start the CPU; -gdb: gdb server
+        extra = ["-S", "-gdb", f"tcp::{GDB_PORT}"] + extra[1:]
+        print("QEMU is paused, waiting for gdb: run `imx gdb` in another "
+              "terminal.\n")
+    print("QEMU mcimx6ul-evk: press Enter at 'Please press Enter...'. "
+          "To quit, type `reboot` (or Ctrl-A X); Ctrl-A C toggles the QEMU "
+          "monitor.\n")
+    # -no-reboot: a guest reboot exits QEMU instead of restarting it.
+    os.execvp("qemu-system-arm", [
+        "qemu-system-arm", "-M", "mcimx6ul-evk", "-m", "512M", "-nographic",
+        "-no-reboot",
+        "-kernel", files[0], "-dtb", files[1], "-initrd", files[2],
+        "-append", "console=ttymxc0,115200 kgdboc=ttymxc0,115200", *extra])
+
+
+# Kernel entry and root-filesystem entry points, in boot order (keep in sync
+# with .vscode/launch.json).
+BOOT_BREAKPOINTS = ["stext", "start_kernel", "populate_rootfs",
+                    "prepare_namespace", "run_init_process"]
+
+
+def find_arm_gdb():
+    for name in ("arm-none-eabi-gdb", "gdb-multiarch", "arm-linux-gnueabihf-gdb"):
+        if shutil.which(name):
+            return shutil.which(name)
+    found = sorted(glob.glob("/Applications/ArmGNUToolchain/*/arm-none-eabi/"
+                             "bin/arm-none-eabi-gdb"))
+    return found[-1] if found else None
+
+
+def gdb(extra):
+    """gdb on vmlinux, attached to QEMU started with `imx qemu debug`.
+
+    PAGE_OFFSET (0x80000000) equals the DDR base here, so kernel symbols are
+    also valid before the MMU is on: hardware breakpoints in head.S work.
+    """
+    vmlinux = os.path.join(KERNEL, "out", "vmlinux")
+    if not os.path.exists(vmlinux):
+        sys.exit(f"missing (run `imx` first):\n  {vmlinux}")
+    arm_gdb = find_arm_gdb()
+    if not arm_gdb:
+        sys.exit("no ARM gdb found (install the Arm GNU Toolchain: "
+                 "arm-none-eabi-gdb)")
+    build = "/build/" + os.path.basename(KERNEL)     # path in the DWARF info
+    print("""Breakpoints, in boot order (`c` goes from one to the next):
+  stext              first kernel instruction (head.S, MMU off)
+  start_kernel       first C function (init/main.c)
+  populate_rootfs    unpacks the initramfs (rootfs.cpio.gz)
+  prepare_namespace  mounts root= from disk (only without an initramfs /init)
+  run_init_process   execs /init: kernel -> rootfs user space
+Commands:
+  c                 continue          si / ni    step one instruction
+  b <function>      breakpoint        s / n      step a source line
+  layout src / layout asm             info registers, bt, x/8i $pc
+""")
+    os.execvp(arm_gdb, [
+        arm_gdb, "-q", vmlinux,
+        "-ex", "set pagination off",
+        # The decompressor writes the kernel over software breakpoints; a
+        # read-only region over .text + .init makes gdb use hardware ones.
+        "-ex", "set mem inaccessible-by-default off",
+        "-ex", "mem 0x80008000 0x80990000 ro",
+        "-ex", f"set substitute-path {build} {KERNEL}",
+        "-ex", f"target remote localhost:{GDB_PORT}",
+        *[a for f in BOOT_BREAKPOINTS for a in ("-ex", f"hbreak {f}")],
+        *extra])
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode in ("", "menuconfig"):
@@ -414,6 +529,10 @@ The build used your menuconfig choices. To keep them for future builds:
                           out=os.path.join(ROOTFS, "out"))
     elif mode == "compdb":
         rc = compdb()
+    elif mode == "qemu":
+        rc = qemu(sys.argv[2:])
+    elif mode == "gdb":
+        rc = gdb(sys.argv[2:])
     elif mode == "load":
         sub = sys.argv[2] if len(sys.argv) > 2 else ""
         if sub not in ("", "ramdisk", "emmc", "prompt"):
